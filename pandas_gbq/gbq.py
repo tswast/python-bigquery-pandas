@@ -69,29 +69,6 @@ def _test_google_api_imports():
     _check_google_client_version()
 
 
-def _try_credentials(project_id, credentials):
-    from google.cloud import bigquery
-    import google.api_core.exceptions
-
-    if credentials is None:
-        return None
-
-    try:
-        client = bigquery.Client(project=project_id, credentials=credentials)
-        # Check if the application has rights to the BigQuery project
-        client.query('SELECT 1').result()
-        return credentials
-    except google.api_core.exceptions.GoogleAPIError:
-        return None
-
-
-class InvalidPrivateKeyFormat(ValueError):
-    """
-    Raised when provided private key has invalid format.
-    """
-    pass
-
-
 class AccessDenied(ValueError):
     """
     Raised when invalid credentials are provided, or tokens have expired.
@@ -171,255 +148,55 @@ class TableCreationError(ValueError):
     pass
 
 
-class GbqConnector(object):
-    scope = 'https://www.googleapis.com/auth/bigquery'
+class Context(object):
+    """Context object to hold default values for pandas-gbq.
 
-    def __init__(self, project_id, reauth=False,
+    Use the :py:attr:`pandas_gbq.context` object to modify the global
+    context.
+    """
+
+    def __init__(self):
+        self._client = None
+
+    @property
+    def client(self):
+        return self._client
+
+    @client.setter
+    def client(self, value):
+        self._client = value
+
+
+class GbqConnector(object):
+    def __init__(self, project_id=None, reauth=False,
                  private_key=None, auth_local_webserver=False,
-                 dialect='legacy'):
+                 dialect='legacy', client=None):
+        global context
+        from google.cloud import bigquery
         from google.api_core.exceptions import GoogleAPIError
         from google.api_core.exceptions import ClientError
         self.http_error = (ClientError, GoogleAPIError)
         self.project_id = project_id
-        self.reauth = reauth
-        self.private_key = private_key
-        self.auth_local_webserver = auth_local_webserver
         self.dialect = dialect
-        self.credentials_path = _get_credentials_file()
-        self.credentials = self.get_credentials()
-        self.client = self.get_client()
 
         # BQ Queries costs $5 per TB. First 1 TB per month is free
         # see here for more: https://cloud.google.com/bigquery/pricing
         self.query_price_for_TB = 5. / 2**40  # USD/TB
 
-    def get_credentials(self):
-        if self.private_key:
-            return self.get_service_account_credentials()
+        # Use cached client if available, skipping auth flow.
+        if client is not None:
+            self.client = client
+        elif context.client is not None and not reauth:
+            self.client = context.client
         else:
-            # Try to retrieve Application Default Credentials
-            credentials = self.get_application_default_credentials()
-            if not credentials:
-                credentials = self.get_user_account_credentials()
-            return credentials
-
-    def get_application_default_credentials(self):
-        """
-        This method tries to retrieve the "default application credentials".
-        This could be useful for running code on Google Cloud Platform.
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        - GoogleCredentials,
-            If the default application credentials can be retrieved
-            from the environment. The retrieved credentials should also
-            have access to the project (self.project_id) on BigQuery.
-        - OR None,
-            If default application credentials can not be retrieved
-            from the environment. Or, the retrieved credentials do not
-            have access to the project (self.project_id) on BigQuery.
-        """
-        import google.auth
-        from google.auth.exceptions import DefaultCredentialsError
-
-        try:
-            credentials, _ = google.auth.default(scopes=[self.scope])
-        except (DefaultCredentialsError, IOError):
-            return None
-
-        return _try_credentials(self.project_id, credentials)
-
-    def load_user_account_credentials(self):
-        """
-        Loads user account credentials from a local file.
-
-        .. versionadded 0.2.0
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        - GoogleCredentials,
-            If the credentials can loaded. The retrieved credentials should
-            also have access to the project (self.project_id) on BigQuery.
-        - OR None,
-            If credentials can not be loaded from a file. Or, the retrieved
-            credentials do not have access to the project (self.project_id)
-            on BigQuery.
-        """
-        import google.auth.transport.requests
-        from google.oauth2.credentials import Credentials
-
-        # Use the default credentials location under ~/.config and the
-        # equivalent directory on windows if the user has not specified a
-        # credentials path.
-        if not self.credentials_path:
-            self.credentials_path = self.get_default_credentials_path()
-
-            # Previously, pandas-gbq saved user account credentials in the
-            # current working directory. If the bigquery_credentials.dat file
-            # exists in the current working directory, move the credentials to
-            # the new default location.
-            if os.path.isfile('bigquery_credentials.dat'):
-                os.rename('bigquery_credentials.dat', self.credentials_path)
-
-        try:
-            with open(self.credentials_path) as credentials_file:
-                credentials_json = json.load(credentials_file)
-        except (IOError, ValueError):
-            return None
-
-        credentials = Credentials(
-            token=credentials_json.get('access_token'),
-            refresh_token=credentials_json.get('refresh_token'),
-            id_token=credentials_json.get('id_token'),
-            token_uri=credentials_json.get('token_uri'),
-            client_id=credentials_json.get('client_id'),
-            client_secret=credentials_json.get('client_secret'),
-            scopes=credentials_json.get('scopes'))
-
-        # Refresh the token before trying to use it.
-        request = google.auth.transport.requests.Request()
-        credentials.refresh(request)
-
-        return _try_credentials(self.project_id, credentials)
-
-    def get_default_credentials_path(self):
-        """
-        Gets the default path to the BigQuery credentials
-
-        .. versionadded 0.3.0
-
-        Returns
-        -------
-        Path to the BigQuery credentials
-        """
-
-        import os
-
-        if os.name == 'nt':
-            config_path = os.environ['APPDATA']
-        else:
-            config_path = os.path.join(os.path.expanduser('~'), '.config')
-
-        config_path = os.path.join(config_path, 'pandas_gbq')
-
-        # Create a pandas_gbq directory in an application-specific hidden
-        # user folder on the operating system.
-        if not os.path.exists(config_path):
-            os.makedirs(config_path)
-
-        return os.path.join(config_path, 'bigquery_credentials.dat')
-
-    def save_user_account_credentials(self, credentials):
-        """
-        Saves user account credentials to a local file.
-
-        .. versionadded 0.2.0
-        """
-        try:
-            with open(self.credentials_path, 'w') as credentials_file:
-                credentials_json = {
-                    'refresh_token': credentials.refresh_token,
-                    'id_token': credentials.id_token,
-                    'token_uri': credentials.token_uri,
-                    'client_id': credentials.client_id,
-                    'client_secret': credentials.client_secret,
-                    'scopes': credentials.scopes,
-                }
-                json.dump(credentials_json, credentials_file)
-        except IOError:
-            logger.warning('Unable to save credentials.')
-
-    def get_user_account_credentials(self):
-        """Gets user account credentials.
-
-        This method authenticates using user credentials, either loading saved
-        credentials from a file or by going through the OAuth flow.
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        GoogleCredentials : credentials
-            Credentials for the user with BigQuery access.
-        """
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from oauthlib.oauth2.rfc6749.errors import OAuth2Error
-
-        credentials = self.load_user_account_credentials()
-
-        client_config = {
-            'installed': {
-                'client_id': ('495642085510-k0tmvj2m941jhre2nbqka17vqpjfddtd'
-                              '.apps.googleusercontent.com'),
-                'client_secret': 'kOc9wMptUtxkcIFbtZCcrEAc',
-                'redirect_uris': ['urn:ietf:wg:oauth:2.0:oob'],
-                'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
-                'token_uri': 'https://accounts.google.com/o/oauth2/token',
-            }
-        }
-
-        if credentials is None or self.reauth:
-            app_flow = InstalledAppFlow.from_client_config(
-                client_config, scopes=[self.scope])
-
-            try:
-                if self.auth_local_webserver:
-                    credentials = app_flow.run_local_server()
-                else:
-                    credentials = app_flow.run_console()
-            except OAuth2Error as ex:
-                raise AccessDenied(
-                    "Unable to get valid credentials: {0}".format(ex))
-
-            self.save_user_account_credentials(credentials)
-
-        return credentials
-
-    def get_service_account_credentials(self):
-        import google.auth.transport.requests
-        from google.oauth2.service_account import Credentials
-        from os.path import isfile
-
-        try:
-            if isfile(self.private_key):
-                with open(self.private_key) as f:
-                    json_key = json.loads(f.read())
-            else:
-                # ugly hack: 'private_key' field has new lines inside,
-                # they break json parser, but we need to preserve them
-                json_key = json.loads(self.private_key.replace('\n', '   '))
-                json_key['private_key'] = json_key['private_key'].replace(
-                    '   ', '\n')
-
-            if compat.PY3:
-                json_key['private_key'] = bytes(
-                    json_key['private_key'], 'UTF-8')
-
-            credentials = Credentials.from_service_account_info(json_key)
-            credentials = credentials.with_scopes([self.scope])
-
-            # Refresh the token before trying to use it.
-            request = google.auth.transport.requests.Request()
-            credentials.refresh(request)
-
-            return credentials
-        except (KeyError, ValueError, TypeError, AttributeError):
-            raise InvalidPrivateKeyFormat(
-                "Private key is missing or invalid. It should be service "
-                "account private key JSON (file path or string contents) "
-                "with at least two keys: 'client_email' and 'private_key'. "
-                "Can be obtained from: https://console.developers.google."
-                "com/permissions/serviceaccounts")
+            from pandas_gbq import auth
+            credentials = auth.get_credentials(
+                private_key=private_key,
+                reauth=reauth,
+                auth_local_webserver=auth_local_webserver)
+            self.client = bigquery.Client(
+                project=project_id, credentials=credentials)
+            context.client = self.client
 
     def _start_timer(self):
         self.start = time.time()
@@ -442,11 +219,6 @@ class GbqConnector(object):
                 return fmt % (num, unit, suffix)
             num /= 1024.0
         return fmt % (num, 'Y', suffix)
-
-    def get_client(self):
-        from google.cloud import bigquery
-        return bigquery.Client(
-            project=self.project_id, credentials=self.credentials)
 
     @staticmethod
     def process_http_error(ex):
@@ -488,13 +260,10 @@ class GbqConnector(object):
                     job_config, BIGQUERY_INSTALLED_VERSION))
             logger.info('ok.\nQuery running...')
         except (RefreshError, ValueError):
-            if self.private_key:
-                raise AccessDenied(
-                    "The service account credentials are not valid")
-            else:
-                raise AccessDenied(
-                    "The credentials have been revoked or expired, "
-                    "please re-run the application to re-authorize")
+            raise AccessDenied(
+                "The credentials have been revoked or expired or are "
+                "otherwise invalid. Please re-run the application to "
+                "re-authorize")
         except self.http_error as ex:
             self.process_http_error(ex)
 
@@ -586,7 +355,8 @@ class GbqConnector(object):
         list of dicts
             Fields representing the schema
         """
-        table_ref = self.client.dataset(dataset_id).table(table_id)
+        table_ref = self.client.dataset(
+            dataset_id, project=self.project_id).table(table_id)
 
         try:
             table = self.client.get_table(table_ref)
@@ -670,6 +440,8 @@ class GbqConnector(object):
         return all(field in fields_remote for field in fields_local)
 
     def delete_and_recreate_table(self, dataset_id, table_id, table_schema):
+        from google.cloud import bigquery
+
         delay = 0
 
         # Changes to table schema may take up to 2 minutes as of May 2015 See
@@ -683,16 +455,15 @@ class GbqConnector(object):
                         'wait 2 minutes. See Google BigQuery issue #191')
             delay = 120
 
-        table = _Table(self.project_id, dataset_id,
-                       private_key=self.private_key)
-        table.delete(table_id)
-        table.create(table_id, table_schema)
+        table_ref = self.client.dataset(
+            dataset_id, project=self.project_id).table(table_id)
+        self.client.delete_table(table_ref)
+        schema_fields = [
+            biquery.SchemaField.from_api_repr(field) for field in table_schema
+        ]
+        table = bigquery.Table(table_ref, schema=schema_fields)
+        self.client.create_table(table)
         sleep(delay)
-
-
-def _get_credentials_file():
-    return os.environ.get(
-        'PANDAS_GBQ_CREDENTIALS_FILE')
 
 
 def _parse_data(schema, rows):
@@ -948,8 +719,9 @@ def to_gbq(dataframe, destination_table, project_id, chunksize=None,
         auth_local_webserver=auth_local_webserver)
     dataset_id, table_id = destination_table.rsplit('.', 1)
 
-    table = _Table(project_id, dataset_id, reauth=reauth,
-                   private_key=private_key)
+    table = _Table(
+        project_id, dataset_id, reauth=reauth, private_key=private_key,
+        client=connector.client)
 
     if not table_schema:
         table_schema = _generate_bq_schema(dataframe)
@@ -1006,9 +778,13 @@ def _generate_bq_schema(df, default_type='STRING'):
 
 class _Table(GbqConnector):
 
-    def __init__(self, project_id, dataset_id, reauth=False, private_key=None):
+    def __init__(
+            self, project_id, dataset_id, reauth=False, private_key=None,
+            client=None):
         self.dataset_id = dataset_id
-        super(_Table, self).__init__(project_id, reauth, private_key)
+        super(_Table, self).__init__(
+            project_id=project_id, reauth=reauth, private_key=private_key,
+            client=client)
 
     def exists(self, table_id):
         """ Check if a table exists in Google BigQuery
@@ -1025,7 +801,8 @@ class _Table(GbqConnector):
         """
         from google.api_core.exceptions import NotFound
 
-        table_ref = self.client.dataset(self.dataset_id).table(table_id)
+        table_ref = self.client.dataset(
+            self.dataset_id, project=self.project_id).table(table_id)
         try:
             self.client.get_table(table_ref)
             return True
@@ -1052,12 +829,13 @@ class _Table(GbqConnector):
             raise TableCreationError("Table {0} already "
                                      "exists".format(table_id))
 
-        if not _Dataset(self.project_id,
-                        private_key=self.private_key).exists(self.dataset_id):
-            _Dataset(self.project_id,
-                     private_key=self.private_key).create(self.dataset_id)
+        if not _Dataset(
+                self.project_id, client=self.client).exists(self.dataset_id):
+            _Dataset(
+                self.project_id, client=self.client).create(self.dataset_id)
 
-        table_ref = self.client.dataset(self.dataset_id).table(table_id)
+        table_ref = self.client.dataset(
+            self.dataset_id, project=self.project_id).table(table_id)
         table = Table(table_ref)
 
         # Manually create the schema objects, adding NULLABLE mode
@@ -1090,7 +868,8 @@ class _Table(GbqConnector):
         if not self.exists(table_id):
             raise NotFoundException("Table does not exist")
 
-        table_ref = self.client.dataset(self.dataset_id).table(table_id)
+        table_ref = self.client.dataset(
+            self.dataset_id, project=self.project_id).table(table_id)
         try:
             self.client.delete_table(table_ref)
         except NotFound:
@@ -1102,8 +881,10 @@ class _Table(GbqConnector):
 
 class _Dataset(GbqConnector):
 
-    def __init__(self, project_id, reauth=False, private_key=None):
-        super(_Dataset, self).__init__(project_id, reauth, private_key)
+    def __init__(self, project_id, reauth=False, private_key=None, client=None):
+        super(_Dataset, self).__init__(
+            project_id=project_id, reauth=reauth, private_key=private_key,
+            client=client)
 
     def exists(self, dataset_id):
         """ Check if a dataset exists in Google BigQuery
@@ -1121,7 +902,8 @@ class _Dataset(GbqConnector):
         from google.api_core.exceptions import NotFound
 
         try:
-            self.client.get_dataset(self.client.dataset(dataset_id))
+            self.client.get_dataset(
+                self.client.dataset(dataset_id, project=self.project_id))
             return True
         except NotFound:
             return False
@@ -1168,7 +950,8 @@ class _Dataset(GbqConnector):
             raise DatasetCreationError("Dataset {0} already "
                                        "exists".format(dataset_id))
 
-        dataset = Dataset(self.client.dataset(dataset_id))
+        dataset = Dataset(
+            self.client.dataset(dataset_id, project=self.project_id))
 
         try:
             self.client.create_dataset(dataset)
@@ -1190,7 +973,8 @@ class _Dataset(GbqConnector):
                 "Dataset {0} does not exist".format(dataset_id))
 
         try:
-            self.client.delete_dataset(self.client.dataset(dataset_id))
+            self.client.delete_dataset(
+                self.client.dataset(dataset_id, project=self.project_id))
 
         except NotFound:
             # Ignore 404 error which may occur if dataset already deleted
@@ -1216,7 +1000,7 @@ class _Dataset(GbqConnector):
 
         try:
             table_response = self.client.list_tables(
-                self.client.dataset(dataset_id))
+                self.client.dataset(dataset_id, project=self.project_id))
 
             for row in table_response:
                 table_list.append(row.table_id)
@@ -1225,3 +1009,6 @@ class _Dataset(GbqConnector):
             self.process_http_error(ex)
 
         return table_list
+
+
+context = Context()

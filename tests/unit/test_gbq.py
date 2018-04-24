@@ -5,6 +5,7 @@ import pytest
 from pandas import DataFrame
 from pandas.compat.numpy import np_datetime64_compat
 
+import pandas_gbq.exceptions
 from pandas_gbq import gbq
 
 try:
@@ -14,7 +15,7 @@ except ImportError:  # pragma: NO COVER
 
 
 @pytest.fixture(autouse=True)
-def mock_bigquery_client(monkeypatch):
+def mock_bigquery_client():
     import google.cloud.bigquery
     import google.cloud.bigquery.table
     mock_client = mock.create_autospec(google.cloud.bigquery.Client)
@@ -29,29 +30,7 @@ def mock_bigquery_client(monkeypatch):
     mock_rows.__iter__.return_value = [(1,)]
     mock_query.result.return_value = mock_rows
     mock_client.query.return_value = mock_query
-    monkeypatch.setattr(
-        gbq.GbqConnector, 'get_client', lambda _: mock_client)
-
-
-@pytest.fixture(autouse=True)
-def no_auth(monkeypatch):
-    import google.auth.credentials
-    mock_credentials = mock.create_autospec(
-        google.auth.credentials.Credentials)
-    monkeypatch.setattr(
-        gbq.GbqConnector,
-        'get_application_default_credentials',
-        lambda _: mock_credentials)
-    monkeypatch.setattr(
-        gbq.GbqConnector,
-        'get_user_account_credentials',
-        lambda _: mock_credentials)
-
-
-def test_should_return_credentials_path_set_by_env_var():
-    env = {'PANDAS_GBQ_CREDENTIALS_FILE': '/tmp/dummy.dat'}
-    with mock.patch.dict('os.environ', env):
-        assert gbq._get_credentials_file() == '/tmp/dummy.dat'
+    gbq.context.client = mock_client
 
 
 @pytest.mark.parametrize(
@@ -175,31 +154,36 @@ def test_that_parse_data_works_properly():
 
 
 def test_read_gbq_with_invalid_private_key_json_should_fail():
-    with pytest.raises(gbq.InvalidPrivateKeyFormat):
+    gbq.context.client = None  # No default client
+    with pytest.raises(pandas_gbq.exceptions.InvalidPrivateKeyFormat):
         gbq.read_gbq('SELECT 1', project_id='x', private_key='y')
 
 
 def test_read_gbq_with_empty_private_key_json_should_fail():
-    with pytest.raises(gbq.InvalidPrivateKeyFormat):
+    gbq.context.client = None  # No default client
+    with pytest.raises(pandas_gbq.exceptions.InvalidPrivateKeyFormat):
         gbq.read_gbq('SELECT 1', project_id='x', private_key='{}')
 
 
 def test_read_gbq_with_private_key_json_wrong_types_should_fail():
-    with pytest.raises(gbq.InvalidPrivateKeyFormat):
+    gbq.context.client = None  # No default client
+    with pytest.raises(pandas_gbq.exceptions.InvalidPrivateKeyFormat):
         gbq.read_gbq(
             'SELECT 1', project_id='x',
             private_key='{ "client_email" : 1, "private_key" : True }')
 
 
 def test_read_gbq_with_empty_private_key_file_should_fail():
+    gbq.context.client = None  # No default client
     with tm.ensure_clean() as empty_file_path:
-        with pytest.raises(gbq.InvalidPrivateKeyFormat):
+        with pytest.raises(pandas_gbq.exceptions.InvalidPrivateKeyFormat):
             gbq.read_gbq('SELECT 1', project_id='x',
                          private_key=empty_file_path)
 
 
 def test_read_gbq_with_corrupted_private_key_json_should_fail():
-    with pytest.raises(gbq.InvalidPrivateKeyFormat):
+    gbq.context.client = None  # No default client
+    with pytest.raises(pandas_gbq.exceptions.InvalidPrivateKeyFormat):
         gbq.read_gbq(
             'SELECT 1', project_id='x', private_key='99999999999999999')
 
