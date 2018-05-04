@@ -553,8 +553,8 @@ class GbqConnector(object):
             rows_iter = query_reply.result()
         except self.http_error as ex:
             self.process_http_error(ex)
-        result_rows = list(rows_iter)
-        total_rows = rows_iter.total_rows
+
+        result_df = rows_iter.to_dataframe()
         schema = {
             'fields': [
                 field.to_api_repr()
@@ -562,9 +562,10 @@ class GbqConnector(object):
         }
 
         # log basic query stats
-        logger.info('Got {} rows.\n'.format(total_rows))
+        logger.info('Got query results dataframe with shape {}.\n'.format(
+            result_df.shape))
 
-        return schema, result_rows
+        return schema, result_df
 
     def load_data(
             self, dataframe, dataset_id, table_id, chunksize=None,
@@ -835,8 +836,9 @@ def read_gbq(query, project_id=None, index_col=None, col_order=None,
     connector = GbqConnector(
         project_id, reauth=reauth, private_key=private_key,
         dialect=dialect, auth_local_webserver=auth_local_webserver)
-    schema, rows = connector.run_query(query, **kwargs)
-    final_df = _parse_data(schema, rows)
+    #schema, rows = connector.run_query(query, **kwargs)
+    #final_df = _parse_data(schema, rows)
+    schema, final_df = connector.run_query(query, **kwargs)
 
     # Reindex the DataFrame on the provided column
     if index_col is not None:
