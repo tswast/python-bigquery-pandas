@@ -1,6 +1,112 @@
 Changelog
 =========
 
+.. _changelog-0.15.0:
+
+0.15.0 / 2021-03-30
+-------------------
+
+Features
+~~~~~~~~
+
+- Load DataFrame with ``to_gbq`` to a table in a project different from the API
+  client project. Specify the target table ID as ``project.dataset.table`` to
+  use this feature. (:issue:`321`, :issue:`347`)
+- Allow billing project to be separate from destination table project in
+  ``to_gbq``. (:issue:`321`)
+
+Bug fixes
+~~~~~~~~~
+
+- Avoid 403 error from ``to_gbq`` when table has ``policyTags``. (:issue:`354`)
+- Avoid ``client.dataset`` deprecation warnings. (:issue:`312`)
+
+Dependencies
+~~~~~~~~~~~~
+
+- Drop support for Python 3.5 and 3.6. (:issue:`337`)
+- Drop support for `google-cloud-bigquery==2.4.*` due to query hanging bug.
+  (:issue:`343`)
+
+
+.. _changelog-0.14.1:
+
+0.14.1 / 2020-11-10
+-------------------
+
+Bug fixes
+~~~~~~~~~
+
+- Use ``object`` dtype for ``TIME`` columns. (:issue:`328`)
+- Encode floating point values with greater precision. (:issue:`326`)
+- Support ``INT64`` and other standard SQL aliases in
+  :func:`~pandas_gbq.to_gbq` ``table_schema`` argument. (:issue:`322`)
+
+
+.. _changelog-0.14.0:
+
+0.14.0 / 2020-10-05
+-------------------
+
+- Add ``dtypes`` argument to ``read_gbq``. Use this argument to override the
+  default ``dtype`` for a particular column in the query results. For
+  example, this can be used to select nullable integer columns as the
+  ``Int64`` nullable integer pandas extension type. (:issue:`242`,
+  :issue:`332`)
+
+.. code-block:: python
+
+   df = gbq.read_gbq(
+       "SELECT CAST(NULL AS INT64) AS null_integer",
+       dtypes={"null_integer": "Int64"},
+   )
+
+Dependency updates
+~~~~~~~~~~~~~~~~~~
+
+- Support ``google-cloud-bigquery-storage`` 2.0 and higher. (:issue:`329`)
+- Update the minimum version of ``pandas`` to 0.20.1.
+  (:issue:`331`)
+
+Internal changes
+~~~~~~~~~~~~~~~~
+
+- Update tests to run against Python 3.8. (:issue:`331`)
+
+
+.. _changelog-0.13.3:
+
+0.13.3 / 2020-09-30
+-------------------
+
+- Include needed "extras" from ``google-cloud-bigquery`` package as
+  dependencies. Exclude incompatible 2.0 version. (:issue:`324`, :issue:`329`)
+
+.. _changelog-0.13.2:
+
+0.13.2 / 2020-05-14
+-------------------
+
+- Fix ``Provided Schema does not match Table`` error when the existing table
+  contains required fields. (:issue:`315`)
+
+.. _changelog-0.13.1:
+
+0.13.1 / 2020-02-13
+-------------------
+
+- Fix ``AttributeError`` with BQ Storage API to download empty results.
+  (:issue:`299`)
+
+.. _changelog-0.13.0:
+
+0.13.0 / 2019-12-12
+-------------------
+
+- Raise ``NotImplementedError`` when the deprecated ``private_key`` argument
+  is used. (:issue:`301`)
+
+
 .. _changelog-0.12.0:
 
 0.12.0 / 2019-11-25

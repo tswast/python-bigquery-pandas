@@ -1,3 +1,7 @@
+# Copyright (c) 2017 pandas-gbq Authors All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 """Nox test automation configuration.
 
 See: https://nox.readthedocs.io/en/latest/
@@ -10,17 +14,18 @@ import shutil
 import nox
 
 
-supported_pythons = ["3.5", "3.6", "3.7"]
-latest_python = "3.7"
+supported_pythons = ["3.7", "3.8"]
+system_test_pythons = ["3.7", "3.8"]
+latest_python = "3.8"
 
 # Use a consistent version of black so CI is deterministic.
-black_package = "black==19.10b0"
+# Should match Stickler: https://stickler-ci.com/docs#black
+black_package = "black==20.8b1"
 
 
-@nox.session
-def lint(session, python=latest_python):
+@nox.session(python=latest_python)
+def lint(session):
     session.install(black_package, "flake8")
-    session.install("-e", ".")
     session.run("flake8", "pandas_gbq")
     session.run("flake8", "tests")
     session.run("black", "--check", ".")
@@ -35,7 +40,14 @@ def blacken(session):
 @nox.session(python=supported_pythons)
 def unit(session):
     session.install("pytest", "pytest-cov")
-    session.install("-e", ".")
+    session.install(
+        "-e",
+        ".",
+        # Use dependencies versions from constraints file. This enables testing
+        # across a more full range of versions of the dependencies.
+        "-c",
+        os.path.join(".", "ci", "constraints-{}.pip".format(session.python)),
+    )
     session.run(
         "pytest",
         os.path.join(".", "tests", "unit"),
@@ -48,10 +60,10 @@ def unit(session):
     )
 
 
-@nox.session
-def cover(session, python=latest_python):
+@nox.session(python=latest_python)
+def cover(session):
     session.install("coverage", "pytest-cov")
-    session.run("coverage", "report", "--show-missing", "--fail-under=74")
+    session.run("coverage", "report", "--show-missing", "--fail-under=73")
     session.run("coverage", "erase")
 
 
@@ -77,19 +89,16 @@ def docs(session):
     )
 
 
-@nox.session(python=supported_pythons)
+@nox.session(python=system_test_pythons)
 def system(session):
     session.install("pytest", "pytest-cov")
     session.install(
-        "-r",
-        os.path.join(".", "ci", "requirements-{}.pip".format(session.python)),
-    )
-    session.install(
         "-e",
         ".",
-        # Use dependencies from requirements file instead.
-        # This enables testing with specific versions of the dependencies.
-        "--no-dependencies",
+        # Use dependencies versions from constraints file. This enables testing
+        # across a more full range of versions of the dependencies.
+        "-c",
+        os.path.join(".", "ci", "constraints-{}.pip".format(session.python)),
     )
 
     # Skip local auth tests on CI.

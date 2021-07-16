@@ -1,3 +1,7 @@
+# Copyright (c) 2017 pandas-gbq Authors All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 import logging
 import time
 import warnings
@@ -5,29 +9,24 @@ from datetime import datetime
 
 import numpy as np
 
+# Required dependencies, but treat as optional so that _test_google_api_imports
+# can provide a better error message.
 try:
-    # The BigQuery Storage API client is an optional dependency. It is only
-    # required when use_bqstorage_api=True.
-    from google.cloud import bigquery_storage
+    from google.api_core import exceptions as google_exceptions
+    from google.cloud import bigquery
 except ImportError:  # pragma: NO COVER
-    bigquery_storage = None
+    bigquery = None
+    google_exceptions = None
 
 from pandas_gbq.exceptions import AccessDenied
+from pandas_gbq.exceptions import PerformanceWarning
+from pandas_gbq import features
+from pandas_gbq.features import FEATURES
 import pandas_gbq.schema
+import pandas_gbq.timestamp
+
 
 logger = logging.getLogger(__name__)
-
-BIGQUERY_INSTALLED_VERSION = None
-BIGQUERY_CLIENT_INFO_VERSION = "1.12.0"
-HAS_CLIENT_INFO = False
-SHOW_VERBOSE_DEPRECATION = False
-SHOW_PRIVATE_KEY_DEPRECATION = False
-PRIVATE_KEY_DEPRECATION_MESSAGE = (
-    "private_key is deprecated and will be removed in a future version."
-    "Use the credentials argument instead. See "
-    "https://pandas-gbq.readthedocs.io/en/latest/howto/authentication.html "
-    "for examples on using the credentials argument with service account keys."
-)
 
 try:
     import tqdm  # noqa
@@ -35,80 +34,31 @@ except ImportError:
     tqdm = None
 
 
-def _check_google_client_version():
-    global BIGQUERY_INSTALLED_VERSION, HAS_CLIENT_INFO, SHOW_VERBOSE_DEPRECATION, SHOW_PRIVATE_KEY_DEPRECATION
-
-    try:
-        import pkg_resources
-
-    except ImportError:
-        raise ImportError("Could not import pkg_resources (setuptools).")
-
-    # https://github.com/GoogleCloudPlatform/google-cloud-python/blob/master/bigquery/CHANGELOG.md
-    bigquery_minimum_version = pkg_resources.parse_version("1.11.0")
-    bigquery_client_info_version = pkg_resources.parse_version(
-        BIGQUERY_CLIENT_INFO_VERSION
-    )
-    BIGQUERY_INSTALLED_VERSION = pkg_resources.get_distribution(
-        "google-cloud-bigquery"
-    ).parsed_version
-
-    HAS_CLIENT_INFO = (
-        BIGQUERY_INSTALLED_VERSION >= bigquery_client_info_version
-    )
-
-    if BIGQUERY_INSTALLED_VERSION < bigquery_minimum_version:
-        raise ImportError(
-            "pandas-gbq requires google-cloud-bigquery >= {0}, "
-            "current version {1}".format(
-                bigquery_minimum_version, BIGQUERY_INSTALLED_VERSION
-            )
-        )
-
-    # Add check for Pandas version before showing deprecation warning.
-    # https://github.com/pydata/pandas-gbq/issues/157
-    pandas_installed_version = pkg_resources.get_distribution(
-        "pandas"
-    ).parsed_version
-    pandas_version_wo_verbosity = pkg_resources.parse_version("0.23.0")
-    SHOW_VERBOSE_DEPRECATION = (
-        pandas_installed_version >= pandas_version_wo_verbosity
-    )
-    pandas_version_with_credentials_arg = pkg_resources.parse_version("0.24.0")
-    SHOW_PRIVATE_KEY_DEPRECATION = (
-        pandas_installed_version >= pandas_version_with_credentials_arg
-    )
-
-
 def _test_google_api_imports():
+    try:
+        import pkg_resources  # noqa
+    except ImportError as ex:
+        raise ImportError("pandas-gbq requires setuptools") from ex
 
     try:
         import pydata_google_auth  # noqa
     except ImportError as ex:
-        raise ImportError(
-            "pandas-gbq requires pydata-google-auth: {0}".format(ex)
-        )
+        raise ImportError("pandas-gbq requires pydata-google-auth") from ex
 
     try:
         from google_auth_oauthlib.flow import InstalledAppFlow  # noqa
     except ImportError as ex:
-        raise ImportError(
-            "pandas-gbq requires google-auth-oauthlib: {0}".format(ex)
-        )
+        raise ImportError("pandas-gbq requires google-auth-oauthlib") from ex
 
     try:
         import google.auth  # noqa
     except ImportError as ex:
-        raise ImportError("pandas-gbq requires google-auth: {0}".format(ex))
+        raise ImportError("pandas-gbq requires google-auth") from ex
 
     try:
         from google.cloud import bigquery  # noqa
     except ImportError as ex:
-        raise ImportError(
-            "pandas-gbq requires google-cloud-bigquery: {0}".format(ex)
-        )
-
-    _check_google_client_version()
+        raise ImportError("pandas-gbq requires google-cloud-bigquery") from ex
 
 
 class DatasetCreationError(ValueError):
@@ -398,7 +348,6 @@ class GbqConnector(object):
         return fmt % (num, "Y", suffix)
 
     def get_client(self):
-        from google.cloud import bigquery
         import pandas
 
         try:
@@ -416,7 +365,7 @@ class GbqConnector(object):
         # In addition to new enough version of google-api-core, a new enough
         # version of google-cloud-bigquery is required to populate the
         # client_info.
-        if HAS_CLIENT_INFO:
+        if FEATURES.bigquery_has_client_info:
             return bigquery.Client(
                 project=self.project_id,
                 credentials=self.credentials,
@@ -439,7 +388,6 @@ class GbqConnector(object):
     ):
         from concurrent.futures import TimeoutError
         from google.auth.exceptions import RefreshError
-        from google.cloud import bigquery
 
         job_config = {
             "query": {
@@ -492,7 +440,10 @@ class GbqConnector(object):
         while query_reply.state != "DONE":
             self.log_elapsed_seconds("  Elapsed", "s. Waiting...")
 
-            timeout_ms = job_config["query"].get("timeoutMs")
+            timeout_ms = job_config.get("jobTimeoutMs") or job_config[
+                "query"
+            ].get("timeoutMs")
+            timeout_ms = int(timeout_ms) if timeout_ms else None
             if timeout_ms and timeout_ms < self.get_elapsed_seconds() * 1000:
                 raise QueryTimeout("Query timeout: {} ms".format(timeout_ms))
 
@@ -526,27 +477,53 @@ class GbqConnector(object):
                 )
             )
 
+        dtypes = kwargs.get("dtypes")
         return self._download_results(
             query_reply,
             max_results=max_results,
             progress_bar_type=progress_bar_type,
+            user_dtypes=dtypes,
         )
 
     def _download_results(
-        self, query_job, max_results=None, progress_bar_type=None
+        self,
+        query_job,
+        max_results=None,
+        progress_bar_type=None,
+        user_dtypes=None,
     ):
         # No results are desired, so don't bother downloading anything.
         if max_results == 0:
             return None
 
-        try:
-            bqstorage_client = None
-            if max_results is None:
-                # Only use the BigQuery Storage API if the full result set is requested.
-                bqstorage_client = _make_bqstorage_client(
-                    self.use_bqstorage_api, self.credentials
-                )
+        if user_dtypes is None:
+            user_dtypes = {}
 
+        if self.use_bqstorage_api and not FEATURES.bigquery_has_bqstorage:
+            warnings.warn(
+                (
+                    "use_bqstorage_api was set, but have google-cloud-bigquery "
+                    "version {}. Requires google-cloud-bigquery version "
+                    "{} or later."
+                ).format(
+                    FEATURES.bigquery_installed_version,
+                    features.BIGQUERY_BQSTORAGE_VERSION,
+                ),
+                PerformanceWarning,
+                stacklevel=4,
+            )
+
+        create_bqstorage_client = self.use_bqstorage_api
+        if max_results is not None:
+            create_bqstorage_client = False
+
+        to_dataframe_kwargs = {}
+        if FEATURES.bigquery_has_bqstorage:
+            to_dataframe_kwargs[
+                "create_bqstorage_client"
+            ] = create_bqstorage_client
+
+        try:
             query_job.result()
             # Get the table schema, so that we can list rows.
             destination = self.client.get_table(query_job.destination)
@@ -555,25 +532,21 @@ class GbqConnector(object):
             )
 
             schema_fields = [field.to_api_repr() for field in rows_iter.schema]
-            nullsafe_dtypes = _bqschema_to_nullsafe_dtypes(schema_fields)
+            conversion_dtypes = _bqschema_to_nullsafe_dtypes(schema_fields)
+            conversion_dtypes.update(user_dtypes)
             df = rows_iter.to_dataframe(
-                dtypes=nullsafe_dtypes,
-                bqstorage_client=bqstorage_client,
+                dtypes=conversion_dtypes,
                 progress_bar_type=progress_bar_type,
+                **to_dataframe_kwargs
             )
         except self.http_error as ex:
             self.process_http_error(ex)
-        finally:
-            if bqstorage_client:
-                # Clean up open socket resources. See:
-                # https://github.com/pydata/pandas-gbq/issues/294
-                bqstorage_client.transport.channel.close()
 
         if df.empty:
             df = _cast_empty_df_dtypes(schema_fields, df)
 
         # Ensure any TIMESTAMP columns are tz-aware.
-        df = _localize_df(schema_fields, df)
+        df = pandas_gbq.timestamp.localize_df(df, schema_fields)
 
         logger.debug("Got {} rows.\n".format(rows_iter.total_rows))
         return df
@@ -581,8 +554,7 @@ class GbqConnector(object):
     def load_data(
         self,
         dataframe,
-        dataset_id,
-        table_id,
+        destination_table_ref,
         chunksize=None,
         schema=None,
         progress_bar=True,
@@ -595,8 +567,7 @@ class GbqConnector(object):
             chunks = load.load_chunks(
                 self.client,
                 dataframe,
-                dataset_id,
-                table_id,
+                destination_table_ref,
                 chunksize=chunksize,
                 schema=schema,
                 location=self.location,
@@ -611,110 +582,6 @@ class GbqConnector(object):
                 )
         except self.http_error as ex:
             self.process_http_error(ex)
-
-    def schema(self, dataset_id, table_id):
-        """Retrieve the schema of the table
-
-        Obtain from BigQuery the field names and field types
-        for the table defined by the parameters
-
-        Parameters
-        ----------
-        dataset_id : str
-            Name of the BigQuery dataset for the table
-        table_id : str
-            Name of the BigQuery table
-
-        Returns
-        -------
-        list of dicts
-            Fields representing the schema
-        """
-        table_ref = self.client.dataset(dataset_id).table(table_id)
-
-        try:
-            table = self.client.get_table(table_ref)
-            remote_schema = table.schema
-
-            remote_fields = [
-                field_remote.to_api_repr() for field_remote in remote_schema
-            ]
-            for field in remote_fields:
-                field["type"] = field["type"].upper()
-                field["mode"] = field["mode"].upper()
-
-            return remote_fields
-        except self.http_error as ex:
-            self.process_http_error(ex)
-
-    def _clean_schema_fields(self, fields):
-        """Return a sanitized version of the schema for comparisons."""
-        fields_sorted = sorted(fields, key=lambda field: field["name"])
-        # Ignore mode and description when comparing schemas.
-        return [
-            {"name": field["name"], "type": field["type"]}
-            for field in fields_sorted
-        ]
-
-    def verify_schema(self, dataset_id, table_id, schema):
-        """Indicate whether schemas match exactly
-
-        Compare the BigQuery table identified in the parameters with
-        the schema passed in and indicate whether all fields in the former
-        are present in the latter. Order is not considered.
-
-        Parameters
-        ----------
-        dataset_id :str
-            Name of the BigQuery dataset for the table
-        table_id : str
-            Name of the BigQuery table
-        schema : list(dict)
-            Schema for comparison. Each item should have
-            a 'name' and a 'type'
-
-        Returns
-        -------
-        bool
-            Whether the schemas match
-        """
-
-        fields_remote = self._clean_schema_fields(
-            self.schema(dataset_id, table_id)
-        )
-        fields_local = self._clean_schema_fields(schema["fields"])
-
-        return fields_remote == fields_local
-
-    def schema_is_subset(self, dataset_id, table_id, schema):
-        """Indicate whether the schema to be uploaded is a subset
-
-        Compare the BigQuery table identified in the parameters with
-        the schema passed in and indicate whether a subset of the fields in
-        the former are present in the latter. Order is not considered.
-
-        Parameters
-        ----------
-        dataset_id : str
-            Name of the BigQuery dataset for the table
-        table_id : str
-            Name of the BigQuery table
-        schema : list(dict)
-            Schema for comparison. Each item should have
-            a 'name' and a 'type'
-
-        Returns
-        -------
-        bool
-            Whether the passed schema is a subset
-        """
-
-        fields_remote = self._clean_schema_fields(
-            self.schema(dataset_id, table_id)
-        )
-        fields_local = self._clean_schema_fields(schema["fields"])
-
-        return all(field in fields_remote for field in fields_local)
 
     def delete_and_recreate_table(self, dataset_id, table_id, table_schema):
         table = _Table(
@@ -742,7 +609,9 @@ def _bqschema_to_nullsafe_dtypes(schema_fields):
         "GEOMETRY": "object",
         "RECORD": "object",
         "STRING": "object",
-        "TIME": "datetime64[ns]",
+        # datetime.time objects cannot be case to datetime64.
+        # https://github.com/pydata/pandas-gbq/issues/328
+        "TIME": "object",
         # pandas doesn't support timezone-aware dtype in DataFrame/Series
         # constructors. It's more idiomatic to localize after construction.
         # https://github.com/pandas-dev/pandas/issues/25843
@@ -793,45 +662,6 @@ def _cast_empty_df_dtypes(schema_fields, df):
     return df
 
 
-def _localize_df(schema_fields, df):
-    """Localize any TIMESTAMP columns to tz-aware type.
-
-    In pandas versions before 0.24.0, DatetimeTZDtype cannot be used as the
-    dtype in Series/DataFrame construction, so localize those columns after
-    the DataFrame is constructed.
-    """
-    for field in schema_fields:
-        column = str(field["name"])
-        if field["mode"].upper() == "REPEATED":
-            continue
-
-        if field["type"].upper() == "TIMESTAMP" and df[column].dt.tz is None:
-            df[column] = df[column].dt.tz_localize("UTC")
-
-    return df
-
-
-def _make_bqstorage_client(use_bqstorage_api, credentials):
-    if not use_bqstorage_api:
-        return None
-
-    if bigquery_storage is None:
-        raise ImportError(
-            "Install the google-cloud-bigquery-storage and fastavro/pyarrow "
-            "packages to use the BigQuery Storage API."
-        )
-
-    import google.api_core.gapic_v1.client_info
-    import pandas
-
-    client_info = google.api_core.gapic_v1.client_info.ClientInfo(
-        user_agent="pandas-{}".format(pandas.__version__)
-    )
-    return bigquery_storage.BigQueryStorageClient(
-        credentials=credentials, client_info=client_info
-    )
-
-
 def read_gbq(
     query,
     project_id=None,
@@ -848,6 +678,7 @@ def read_gbq(
     verbose=None,
     private_key=None,
     progress_bar_type="tqdm",
+    dtypes=None,
 ):
     r"""Load data from Google BigQuery using google-cloud-python
 
@@ -951,27 +782,12 @@ def read_gbq(
         results.
 
         .. versionadded:: 0.12.0
-    verbose : None, deprecated
-        Deprecated in Pandas-GBQ 0.4.0. Use the `logging module
-        to adjust verbosity instead
-        <https://pandas-gbq.readthedocs.io/en/latest/intro.html#logging>`__.
-    private_key : str, deprecated
-        Deprecated in pandas-gbq version 0.8.0. Use the ``credentials``
-        parameter and
-        :func:`google.oauth2.service_account.Credentials.from_service_account_info`
-        or
-        :func:`google.oauth2.service_account.Credentials.from_service_account_file`
-        instead.
-
-        Service account private key in JSON format. Can be file path
-        or string contents. This is useful for remote server
-        authentication (eg. Jupyter/IPython notebook on remote host).
-
     progress_bar_type (Optional[str]):
-        If set, use the `tqdm <https://tqdm.github.io/>`_ library to
+        If set, use the `tqdm <https://tqdm.github.io/>`__ library to
         display a progress bar while the data downloads. Install the
         ``tqdm`` package to use this feature.
         Possible values of ``progress_bar_type`` include:
+
         ``None``
             No progress bar.
         ``'tqdm'``
@@ -983,6 +799,21 @@ def read_gbq(
         ``'tqdm_gui'``
             Use the :func:`tqdm.tqdm_gui` function to display a
             progress bar as a graphical dialog box.
+    dtypes : dict, optional
+        A dictionary of column names to pandas ``dtype``. The provided
+        ``dtype`` is used when constructing the series for the column
+        specified. Otherwise, a default ``dtype`` is used.
+    verbose : None, deprecated
+        Deprecated in Pandas-GBQ 0.4.0. Use the `logging module
+        to adjust verbosity instead
+        <https://pandas-gbq.readthedocs.io/en/latest/intro.html#logging>`__.
+    private_key : str, deprecated
+        Deprecated in pandas-gbq version 0.8.0. Use the ``credentials``
+        parameter and
+        :func:`google.oauth2.service_account.Credentials.from_service_account_info`
+        or
+        :func:`google.oauth2.service_account.Credentials.from_service_account_file`
+        instead.
 
     Returns
     -------
@@ -999,18 +830,13 @@ def read_gbq(
 
     _test_google_api_imports()
 
-    if verbose is not None and SHOW_VERBOSE_DEPRECATION:
+    if verbose is not None and FEATURES.pandas_has_deprecated_verbose:
         warnings.warn(
             "verbose is deprecated and will be removed in "
             "a future version. Set logging level in order to vary "
             "verbosity",
             FutureWarning,
             stacklevel=2,
-        )
-
-    if private_key is not None and SHOW_PRIVATE_KEY_DEPRECATION:
-        warnings.warn(
-            PRIVATE_KEY_DEPRECATION_MESSAGE, FutureWarning, stacklevel=2
         )
 
     if dialect not in ("legacy", "standard"):
@@ -1032,6 +858,7 @@ def read_gbq(
         configuration=configuration,
         max_results=max_results,
         progress_bar_type=progress_bar_type,
+        dtypes=dtypes,
     )
 
     # Reindex the DataFrame on the provided column
@@ -1094,7 +921,8 @@ def to_gbq(
     dataframe : pandas.DataFrame
         DataFrame to be written to a Google BigQuery table.
     destination_table : str
-        Name of table to be written, in the form ``dataset.tablename``.
+        Name of table to be written, in the form ``dataset.tablename`` or
+        ``project.dataset.tablename``.
     project_id : str, optional
         Google BigQuery Account project ID. Optional when available from
         the environment.
@@ -1172,16 +1000,11 @@ def to_gbq(
         or
         :func:`google.oauth2.service_account.Credentials.from_service_account_file`
         instead.
-
-        Service account private key in JSON format. Can be file path
-        or string contents. This is useful for remote server
-        authentication (eg. Jupyter/IPython notebook on remote host).
     """
 
     _test_google_api_imports()
-    from pandas_gbq import schema
 
-    if verbose is not None and SHOW_VERBOSE_DEPRECATION:
+    if verbose is not None and FEATURES.pandas_has_deprecated_verbose:
         warnings.warn(
             "verbose is deprecated and will be removed in "
             "a future version. Set logging level in order to vary "
@@ -1190,17 +1013,13 @@ def to_gbq(
             stacklevel=1,
         )
 
-    if private_key is not None and SHOW_PRIVATE_KEY_DEPRECATION:
-        warnings.warn(
-            PRIVATE_KEY_DEPRECATION_MESSAGE, FutureWarning, stacklevel=2
-        )
-
     if if_exists not in ("fail", "replace", "append"):
         raise ValueError("'{0}' is not valid for if_exists".format(if_exists))
 
     if "." not in destination_table:
         raise NotFoundException(
-            "Invalid Table Name. Should be of the form 'datasetId.tableId' "
+            "Invalid Table Name. Should be of the form 'datasetId.tableId' or "
+            "'projectId.datasetId.tableId'"
         )
 
     connector = GbqConnector(
@@ -1211,25 +1030,38 @@ def to_gbq(
         credentials=credentials,
         private_key=private_key,
     )
-    dataset_id, table_id = destination_table.rsplit(".", 1)
+    bqclient = connector.client
 
-    table = _Table(
-        project_id,
-        dataset_id,
-        location=location,
-        credentials=connector.credentials,
+    destination_table_ref = bigquery.table.TableReference.from_string(
+        destination_table, default_project=connector.project_id
     )
+
+    project_id_table = destination_table_ref.project
+    dataset_id = destination_table_ref.dataset_id
+    table_id = destination_table_ref.table_id
 
     default_schema = _generate_bq_schema(dataframe)
     if not table_schema:
         table_schema = default_schema
     else:
-        table_schema = schema.update_schema(
+        table_schema = pandas_gbq.schema.update_schema(
             default_schema, dict(fields=table_schema)
         )
 
     # If table exists, check if_exists parameter
-    if table.exists(table_id):
+    try:
+        table = bqclient.get_table(destination_table_ref)
+    except google_exceptions.NotFound:
+        table_connector = _Table(
+            project_id_table,
+            dataset_id,
+            location=location,
+            credentials=connector.credentials,
+        )
+        table_connector.create(table_id, table_schema)
+    else:
+        original_schema = pandas_gbq.schema.to_pandas_gbq(table.schema)
+
         if if_exists == "fail":
             raise TableCreationError(
                 "Could not create the table because it "
@@ -1242,16 +1074,20 @@ def to_gbq(
                 dataset_id, table_id, table_schema
             )
         elif if_exists == "append":
-            if not connector.schema_is_subset(
-                dataset_id, table_id, table_schema
+            if not pandas_gbq.schema.schema_is_subset(
+                original_schema, table_schema
             ):
                 raise InvalidSchema(
                     "Please verify that the structure and "
                     "data types in the DataFrame match the "
                     "schema of the destination table."
                 )
-    else:
-        table.create(table_id, table_schema)
+
+            # Update the local `table_schema` so mode (NULLABLE/REQUIRED)
+            # matches. See: https://github.com/pydata/pandas-gbq/issues/315
+            table_schema = pandas_gbq.schema.update_schema(
+                table_schema, original_schema
+            )
 
     if dataframe.empty:
         # Create the table (if needed), but don't try to run a load job with an
@@ -1260,8 +1096,7 @@ def to_gbq(
 
     connector.load_data(
         dataframe,
-        dataset_id,
-        table_id,
+        destination_table_ref,
         chunksize=chunksize,
         schema=table_schema,
         progress_bar=progress_bar,
@@ -1297,7 +1132,7 @@ def _generate_bq_schema(df, default_type="STRING"):
     issues in the default schema generation. Now that individual columns can
     be overridden: https://github.com/pydata/pandas-gbq/issues/218, this
     method can be removed after there is time to migrate away from this
-    method. """
+    method."""
     from pandas_gbq import schema
 
     return schema.generate_bq_schema(df, default_type=default_type)
@@ -1322,8 +1157,17 @@ class _Table(GbqConnector):
             private_key=private_key,
         )
 
+    def _table_ref(self, table_id):
+        """Return a BigQuery client library table reference"""
+        from google.cloud.bigquery import DatasetReference
+        from google.cloud.bigquery import TableReference
+
+        return TableReference(
+            DatasetReference(self.project_id, self.dataset_id), table_id
+        )
+
     def exists(self, table_id):
-        """ Check if a table exists in Google BigQuery
+        """Check if a table exists in Google BigQuery
 
         Parameters
         ----------
@@ -1337,7 +1181,7 @@ class _Table(GbqConnector):
         """
         from google.api_core.exceptions import NotFound
 
-        table_ref = self.client.dataset(self.dataset_id).table(table_id)
+        table_ref = self._table_ref(table_id)
         try:
             self.client.get_table(table_ref)
             return True
@@ -1347,7 +1191,7 @@ class _Table(GbqConnector):
             self.process_http_error(ex)
 
     def create(self, table_id, schema):
-        """ Create a table in Google BigQuery given a table and schema
+        """Create a table in Google BigQuery given a table and schema
 
         Parameters
         ----------
@@ -1357,12 +1201,13 @@ class _Table(GbqConnector):
             Use the generate_bq_schema to generate your table schema from a
             dataframe.
         """
-        from google.cloud.bigquery import SchemaField
+        from google.cloud.bigquery import DatasetReference
         from google.cloud.bigquery import Table
+        from google.cloud.bigquery import TableReference
 
         if self.exists(table_id):
             raise TableCreationError(
-                "Table {0} already " "exists".format(table_id)
+                "Table {0} already exists".format(table_id)
             )
 
         if not _Dataset(self.project_id, credentials=self.credentials).exists(
@@ -1374,14 +1219,11 @@ class _Table(GbqConnector):
                 location=self.location,
             ).create(self.dataset_id)
 
-        table_ref = self.client.dataset(self.dataset_id).table(table_id)
+        table_ref = TableReference(
+            DatasetReference(self.project_id, self.dataset_id), table_id
+        )
         table = Table(table_ref)
-
-        schema = pandas_gbq.schema.add_default_nullable_mode(schema)
-
-        table.schema = [
-            SchemaField.from_api_repr(field) for field in schema["fields"]
-        ]
+        table.schema = pandas_gbq.schema.to_google_cloud_bigquery(schema)
 
         try:
             self.client.create_table(table)
@@ -1389,7 +1231,7 @@ class _Table(GbqConnector):
             self.process_http_error(ex)
 
     def delete(self, table_id):
-        """ Delete a table in Google BigQuery
+        """Delete a table in Google BigQuery
 
         Parameters
         ----------
@@ -1401,7 +1243,7 @@ class _Table(GbqConnector):
         if not self.exists(table_id):
             raise NotFoundException("Table does not exist")
 
-        table_ref = self.client.dataset(self.dataset_id).table(table_id)
+        table_ref = self._table_ref(table_id)
         try:
             self.client.delete_table(table_ref)
         except NotFound:
@@ -1428,8 +1270,14 @@ class _Dataset(GbqConnector):
             private_key=private_key,
         )
 
+    def _dataset_ref(self, dataset_id):
+        """Return a BigQuery client library dataset reference"""
+        from google.cloud.bigquery import DatasetReference
+
+        return DatasetReference(self.project_id, dataset_id)
+
     def exists(self, dataset_id):
-        """ Check if a dataset exists in Google BigQuery
+        """Check if a dataset exists in Google BigQuery
 
         Parameters
         ----------
@@ -1444,7 +1292,7 @@ class _Dataset(GbqConnector):
         from google.api_core.exceptions import NotFound
 
         try:
-            self.client.get_dataset(self.client.dataset(dataset_id))
+            self.client.get_dataset(self._dataset_ref(dataset_id))
             return True
         except NotFound:
             return False
@@ -1452,7 +1300,7 @@ class _Dataset(GbqConnector):
             self.process_http_error(ex)
 
     def create(self, dataset_id):
-        """ Create a dataset in Google BigQuery
+        """Create a dataset in Google BigQuery
 
         Parameters
         ----------
@@ -1466,7 +1314,7 @@ class _Dataset(GbqConnector):
                 "Dataset {0} already " "exists".format(dataset_id)
             )
 
-        dataset = Dataset(self.client.dataset(dataset_id))
+        dataset = Dataset(self._dataset_ref(dataset_id))
 
         if self.location is not None:
             dataset.location = self.location

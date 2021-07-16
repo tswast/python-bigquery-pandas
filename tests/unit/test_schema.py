@@ -1,9 +1,76 @@
+# Copyright (c) 2017 pandas-gbq Authors All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 import datetime
 
 import pandas
 import pytest
 
-import pandas_gbq.schema
+
+@pytest.fixture
+def module_under_test():
+    import pandas_gbq.schema
+
+    return pandas_gbq.schema
+
+
+@pytest.mark.parametrize(
+    "original_fields,dataframe_fields",
+    [
+        (
+            [
+                {"name": "A", "type": "FLOAT"},
+                {"name": "B", "type": "FLOAT64"},
+                {"name": "C", "type": "STRING"},
+            ],
+            [
+                {"name": "A", "type": "FLOAT64"},
+                {"name": "B", "type": "FLOAT"},
+            ],
+        ),
+        # Original schema from API may contain legacy SQL datatype names.
+        # https://github.com/pydata/pandas-gbq/issues/322
+        (
+            [{"name": "A", "type": "INTEGER"}],
+            [{"name": "A", "type": "INT64"}],
+        ),
+        (
+            [{"name": "A", "type": "BOOL"}],
+            [{"name": "A", "type": "BOOLEAN"}],
+        ),
+        (
+            # TODO: include sub-fields when struct uploads are supported.
+            [{"name": "A", "type": "STRUCT"}],
+            [{"name": "A", "type": "RECORD"}],
+        ),
+    ],
+)
+def test_schema_is_subset_passes_if_subset(
+    module_under_test, original_fields, dataframe_fields
+):
+    # Issue #24 schema_is_subset indicates whether the schema of the
+    # dataframe is a subset of the schema of the bigquery table
+    table_schema = {"fields": original_fields}
+    tested_schema = {"fields": dataframe_fields}
+    assert module_under_test.schema_is_subset(table_schema, tested_schema)
+
+
+def test_schema_is_subset_fails_if_not_subset(module_under_test):
+    table_schema = {
+        "fields": [
+            {"name": "A", "type": "FLOAT"},
+            {"name": "B", "type": "FLOAT"},
+            {"name": "C", "type": "STRING"},
+        ]
+    }
+    tested_schema = {
+        "fields": [
+            {"name": "A", "type": "FLOAT"},
+            {"name": "C", "type": "FLOAT"},
+        ]
+    }
+    assert not module_under_test.schema_is_subset(table_schema, tested_schema)
 
 
 @pytest.mark.parametrize(
@@ -51,8 +118,8 @@ import pandas_gbq.schema
         ),
     ],
 )
-def test_generate_bq_schema(dataframe, expected_schema):
-    schema = pandas_gbq.schema.generate_bq_schema(dataframe)
+def test_generate_bq_schema(module_under_test, dataframe, expected_schema):
+    schema = module_under_test.generate_bq_schema(dataframe)
     assert schema == expected_schema
 
 
@@ -62,16 +129,13 @@ def test_generate_bq_schema(dataframe, expected_schema):
         (
             {"fields": [{"name": "col1", "type": "INTEGER"}]},
             {"fields": [{"name": "col2", "type": "TIMESTAMP"}]},
-            {
-                "fields": [
-                    {"name": "col1", "type": "INTEGER"},
-                    {"name": "col2", "type": "TIMESTAMP"},
-                ]
-            },
+            # Ignore fields that aren't in the DataFrame.
+            {"fields": [{"name": "col1", "type": "INTEGER"}]},
         ),
         (
             {"fields": [{"name": "col1", "type": "INTEGER"}]},
             {"fields": [{"name": "col1", "type": "BOOLEAN"}]},
+            # Update type for fields that are in the DataFrame.
             {"fields": [{"name": "col1", "type": "BOOLEAN"}]},
         ),
         (
@@ -91,12 +155,13 @@ def test_generate_bq_schema(dataframe, expected_schema):
                 "fields": [
                     {"name": "col1", "type": "INTEGER"},
                     {"name": "col2", "type": "BOOLEAN"},
-                    {"name": "col3", "type": "FLOAT"},
                 ]
             },
         ),
     ],
 )
-def test_update_schema(schema_old, schema_new, expected_output):
-    output = pandas_gbq.schema.update_schema(schema_old, schema_new)
+def test_update_schema(
+    module_under_test, schema_old, schema_new, expected_output
+):
+    output = module_under_test.update_schema(schema_old, schema_new)
     assert output == expected_output

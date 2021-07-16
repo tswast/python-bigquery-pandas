@@ -1,30 +1,9 @@
+# Copyright (c) 2017 pandas-gbq Authors All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 version: 2
 jobs:
-  # Pip
-  "pip-3.5":
-    docker:
-      - image: thekevjames/nox
-    steps:
-      - checkout
-      - run: ci/config_auth.sh
-      - run: nox -s unit-3.5 system-3.5
-
-  "pip-3.6":
-    docker:
-      - image: thekevjames/nox
-    steps:
-      - checkout
-      - run: ci/config_auth.sh
-      - run: nox -s unit-3.6 system-3.6
-
-  "pip-3.7":
-    docker:
-      - image: thekevjames/nox
-    steps:
-      - checkout
-      - run: ci/config_auth.sh
-      - run: nox -s unit-3.7 system-3.7 cover
-
   "lint":
     docker:
       - image: thekevjames/nox
@@ -35,23 +14,49 @@ jobs:
     steps:
       - checkout
       - run: nox -s lint
-
-  # Conda
-  "conda-3.6-0.20.1":
+  "docs-presubmit":
     docker:
-      - image: continuumio/miniconda3
+      - image: thekevjames/nox
     environment:
-      PYTHON: "3.6"
-      PANDAS: "0.20.1"
+      # Resolve "Python 3 was configured to use ASCII as encoding for the environment"
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+    steps:
+      - checkout
+      - run: nox -s docs
+
+  # Pip
+  "pip-3.7":
+    docker:
+      - image: thekevjames/nox
     steps:
       - checkout
       - run: ci/config_auth.sh
-      - run: ci/run_conda.sh
-  "conda-3.7-NIGHTLY":
+      - run: nox -s unit-3.7
+  "pip-3.8":
+    docker:
+      - image: thekevjames/nox
+    steps:
+      - checkout
+      - run: ci/config_auth.sh
+      - run: nox -s unit-3.8 system-3.8 cover
+
+  # Conda
+  "conda-3.7":
     docker:
       - image: continuumio/miniconda3
     environment:
       PYTHON: "3.7"
+      PANDAS: "0.23.2"
+    steps:
+      - checkout
+      - run: ci/config_auth.sh
+      - run: ci/run_conda.sh
+  "conda-3.9-NIGHTLY":
+    docker:
+      - image: continuumio/miniconda3
+    environment:
+      PYTHON: "3.9"
       PANDAS: "NIGHTLY"
     steps:
       - checkout
@@ -62,9 +67,9 @@ workflows:
   version: 2
   build:
     jobs:
-      - "pip-3.5"
-      - "pip-3.6"
-      - "pip-3.7"
       - lint
-      - "conda-3.6-0.20.1"
-      - "conda-3.7-NIGHTLY"
+      - docs-presubmit
+      - "pip-3.7"
+      - "pip-3.8"
+      - "conda-3.7"
+      - "conda-3.9-NIGHTLY"
